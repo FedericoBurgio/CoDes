@@ -31,6 +31,15 @@ def create_circular_traj(center, radius, period, z_height, dt):
 
     return pos_traj, rot_traj, dt, total_time
 
+def create_setpoint_traj(x, y, z, xrot, yrot, zrot, T, dt):
+
+    steps = int(T / dt)
+    pos_traj = np.full((steps, 3), [x, y, z])
+    desired_rot = pin.rpy.rpyToMatrix(xrot, yrot, zrot)
+    rot_traj = np.repeat(desired_rot[np.newaxis, :, :], steps, axis=0)
+
+    return pos_traj, rot_traj
+
 def plot_traj(qTraj, dqTraj, ddqTraj, dt, total_time):
     time = np.arange(0,total_time,dt)
 

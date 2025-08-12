@@ -54,13 +54,13 @@ class Solver:
         time.sleep(2)
   
     def track_trajectory(self, pos_traj, rot_traj, dt, total_time,
-                    kp_lin=1e3, kp_rot=None,
-                    kd_lin=1e2, kd_rot=None):
+                    kp_lin=1e3, kp_rot=1e2,
+                    kd_lin=None, kd_rot=None):
         steps = pos_traj.shape[0]
 
-        if kd_rot == None: kd_rot=np.sqrt(2*kd_lin)
-        if kp_rot == None: kp_rot=np.sqrt(2*kp_lin)
-        
+        if kd_lin == None: kd_lin=np.sqrt(2*kp_lin)
+        if kd_rot == None: kd_rot=np.sqrt(2*kp_rot)
+
         Kp = np.diag([kp_lin]*3 + [kp_rot]*3)
         Kd = np.diag([kd_lin]*3 + [kd_rot]*3)
 
@@ -73,29 +73,34 @@ class Solver:
         ddq_traj = np.empty((steps,self.rmodel.nq))
         oMf_traj = [None] * steps #cartesian xyz, wrld frame
 
+        grinder_traj = np.empty((steps,3)) #grinder position in world frame
+        dqmax = np.array([3, 3, 3, 3, 3, 3]) #max joint velocity
+        dqqmax = np.array([30, 30, 30, 30, 30, 30]) #max joint acceleration
         for i in range(steps):
             desired_pos = pos_traj[i]
             desired_rot = rot_traj[i]
 
             oMf = self.data.oMf[self.ee_id].copy()  # get current end-effector pose
+            oRf = oMf.rotation  # Rotation of the end-effector in world frame
             oMfdesired = pin.SE3(desired_rot, desired_pos)
+            fMfdesired = oMf.inverse() * oMfdesired
+            err_local = pin.log(fMfdesired).vector
 
-            xEE = pin.log(oMf).vector  # get end-effector position in world frame
+            E = np.block([[oRf, np.zeros((3,3))],
+              [np.zeros((3,3)), oRf]])
+            err = E @ err_local
+
             self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
             self.viz.viewer["point"].set_transform(tf.translation_matrix(oMf.translation))
 
             self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
             self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(self.grinder.x[:3]))
-            #gridner.x print
-            print(f"Grinder position: {self.grinder.x[:3]}")
-            # orientation: convert to minimal 3D (or keep rotation matrix)
-            # get local orientation error if using angle-axis
-            # xEE[3:] = orientation_from_rotation_matrix(oMf.rotation)
-            # vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id, pin.ReferenceFrame.WORLD).vector
+           
             vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).vector
 
             #if i % force_steps == 0: f+=self.random_force(25)
-            fext = self.random_force(25)  if i % force_steps == 0 else np.zeros(6) #random force every force_period seconds
+            fext = self.random_force(100)  if i % force_steps == 0 else np.zeros(6) #random force every force_period seconds
+            fext = np.array([1e3]*6) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
             wrench = self.grinder.dyn(oMf, vEE, fext) #get the wrench in the world frame   
             
 
@@ -109,12 +114,10 @@ class Solver:
             pin.updateFramePlacements(self.rmodel, self.data)
             pin.computeAllTerms(self.rmodel, self.data, self.q, self.dq)
 
-            
-            fMfdesired = oMf.inverse() * oMfdesired
-            err = pin.log(fMfdesired).vector
+           
 
             J = pin.computeFrameJacobian(self.rmodel, self.data, self.q,
-                                        self.ee_id, pin.ReferenceFrame.LOCAL)
+                                        self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
             err_dx = - J @ self.dq
 
             ddx_des = Kp @ err + Kd @ err_dx
@@ -127,25 +130,32 @@ class Solver:
             mu = Lambda @ (J @ np.linalg.inv(M) @ b)
             f = Lambda @ ddx_des + mu - wrench
 
-            #if i % force_steps == 0: f+=self.random_force(25)
+            #if i % force_steps == 0: f+=self.random_force(25) to apply f firectly to the ee
 
-            tau = J.T @ f  # No +b here, since mu alrdq_traj[]eady used
+            tau = J.T @ f  # No +b here, since mu already used
 
             # Integrate
-            ddq = pin.aba(self.rmodel, self.data, self.q, self.dq, tau)
-            self.dq += dt * ddq
+            ddq = np.clip(pin.aba(self.rmodel, self.data, self.q, self.dq, tau), -dqqmax, dqqmax)
+            self.dq = np.clip(self.dq + ddq * dt, -dqmax, dqmax)
             self.q = pin.integrate(self.rmodel, self.q, dt * self.dq)
+            
             self.grinder.step()
+            
             q_traj[i]=self.q.copy()
             dq_traj[i]=self.dq.copy()
             ddq_traj[i]=ddq.copy()
             oMf_traj[i]=oMf.copy()
-            
-        return q_traj, dq_traj, ddq_traj, oMf_traj, dt, total_time
 
-    def random_force(self, force_std, torque_std = None):
-        if torque_std == None: torque_std = force_std * 0.2
-        return np.concatenate([np.random.normal(0, force_std, 3),np.random.normal(0, force_std, 3)])
+            grinder_traj[i] = self.grinder.x[:3].copy()
+            
+        return q_traj, dq_traj, ddq_traj, oMf_traj, grinder_traj, dt, total_time
+
+    def random_force(self, force_std, torque_std=None):
+        if torque_std is None:
+            torque_std = 0.2 * force_std
+        f = np.random.normal(0, force_std, 3)
+        tau = np.random.normal(0, torque_std, 3)
+        return np.concatenate([f, tau])
 
     def plot_taskspace_trajectory(self, pos_traj, name="desired_traj", color=0x00ff00):
         """
@@ -166,20 +176,32 @@ class Solver:
             )
         )
 
-    def replay_traj(self, qtraj, eetraj):
-        j=0
+    def replay_traj(self, qtraj, eetraj, grinder_traj):
+        i=0
         import meshcat.geometry as g
         #breakpoint()
+        while i < qtraj.shape[0]:
+            self.viz.display(qtraj[i])
+            desired_pos = eetraj[i].translation
+            self.viz.viewer["targetPose"].set_object(g.triad(scale=0.2))
+            self.viz.viewer["targetPose"].set_transform(eetraj[i].homogeneous)
 
+            # Display grinder position
+            self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
+            self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(grinder_traj[i]))
+
+            time.sleep(2e-3)
+            print(i)
+            i+=1
         #self.plot_taskspace_trajectory(eetraj.translation, "eetraj", color=0xff0000)
-        for q_step in qtraj:
-            self.viz.display(q_step)
-            #self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
-            #self.viz.viewer["point"].set_transform(tf.translation_matrix(desired_pos))
-            #self.viz.viewer["targetPose"].set_object(g.triad(scale=0.2))
-            #self.viz.viewer["targetPose"].set_transform(eetraj[j].homogeneous)
+        # for q_step in qtraj:
+        #     self.viz.display(q_step)
+        #     #self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
+        #     #self.viz.viewer["point"].set_transform(tf.translation_matrix(desired_pos))
+        #     #self.viz.viewer["targetPose"].set_object(g.triad(scale=0.2))
+        #     #self.viz.viewer["targetPose"].set_transform(eetraj[j].homogeneous)
 
             
-            time.sleep(1e-3)
-            print(j)
-            j+=1
+        #     time.sleep(1e-3)
+        #     print(j)
+        #     j+=1
