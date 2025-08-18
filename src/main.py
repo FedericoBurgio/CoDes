@@ -12,7 +12,7 @@ dt = 1e-3  # Time step for the simulation
 T = 5  # Total time for the trajectory
 pos_traj, rot_traj = utils.create_setpoint_traj(0.1, 0.2, 0.9, 0, 0, 0, T, dt)
 
-qtraj, dqtraj, ddqtraj, eetraj, grinder_traj, dt, T = solver.track_trajectory(pos_traj, rot_traj, kp_lin=1000, kd_rot=100, dt=dt, total_time=T)
+qtraj, dqtraj, ddqtraj, eetraj, grinder_traj, dt, T = solver.track_trajectory(pos_traj, rot_traj, kp_lin=1000, kp_rot=500, dt=dt, total_time=T)
 
 solver.replay_traj(qtraj, eetraj, grinder_traj)
 

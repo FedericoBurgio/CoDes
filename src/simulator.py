@@ -26,7 +26,7 @@ class Solver:
         self.visual_init()
 
         #grinder - externally initialized
-        self.grinder = GrinderAndInterface(10, np.eye(3), [0, 0, 0.1], self.data.oMf[self.ee_id])
+        self.grinder = GrinderAndInterface(5, np.eye(3), [0, 0, 0.05], self.data.oMf[self.ee_id])
 
     def robot_init(self, rnd):
         self.q = np.zeros(self.rmodel.nq)
@@ -85,10 +85,17 @@ class Solver:
             oMfdesired = pin.SE3(desired_rot, desired_pos)
             fMfdesired = oMf.inverse() * oMfdesired
             err_local = pin.log(fMfdesired).vector
-
+            
             E = np.block([[oRf, np.zeros((3,3))],
               [np.zeros((3,3)), oRf]])
             err = E @ err_local
+            #err = np.zeros(6) # Dummy: EE stays in place (debugging)
+
+            self.viz.viewer["Setpoint"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x0000ff))
+            self.viz.viewer["Setpoint"].set_transform(tf.translation_matrix(pos_traj[i]))
+
+            self.viz.viewer["SetPose"].set_object(g.triad(scale=0.2))
+            self.viz.viewer["SetPose"].set_transform(pin.SE3(rot_traj[i], pos_traj[i]).homogeneous)
 
             self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
             self.viz.viewer["point"].set_transform(tf.translation_matrix(oMf.translation))
@@ -96,25 +103,20 @@ class Solver:
             self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
             self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(self.grinder.x[:3]))
            
-            vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED).vector
-
+            vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+           
             #if i % force_steps == 0: f+=self.random_force(25)
-            fext = self.random_force(100)  if i % force_steps == 0 else np.zeros(6) #random force every force_period seconds
-            fext = np.array([1e3]*6) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
-            wrench = self.grinder.dyn(oMf, vEE, fext) #get the wrench in the world frame   
-            
+            fext = self.random_force(50000)  if i % force_steps == 0 else np.zeros(6) #random force every force_period seconds
+            #fext = np.array([1e4]*6) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
+            #fext = np.array([0]*3+[1e5]+[0]*2) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
+            wrench = self.grinder.dyn(oMf, vEE, fext) #get the wrench in the world frame
 
             #wrench = np.zeros(6) 
-            
-            # self.grinder.R = oMf.rotation @ pin.exp3(self.grinder.xdotdot[3:]*dt)
-            # self.grinder.xdot += self.grinder.xdotdot * dt
-            # self.grinder.x += self.grinder.xdot * dt
 
             pin.forwardKinematics(self.rmodel, self.data, self.q, self.dq)
             pin.updateFramePlacements(self.rmodel, self.data)
             pin.computeAllTerms(self.rmodel, self.data, self.q, self.dq)
 
-           
 
             J = pin.computeFrameJacobian(self.rmodel, self.data, self.q,
                                         self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
@@ -130,7 +132,7 @@ class Solver:
             mu = Lambda @ (J @ np.linalg.inv(M) @ b)
             f = Lambda @ ddx_des + mu - wrench
 
-            #if i % force_steps == 0: f+=self.random_force(25) to apply f firectly to the ee
+            #if i % force_steps == 0: f+=self.random_force(25) # apply f firectly to the ee
 
             tau = J.T @ f  # No +b here, since mu already used
 
@@ -193,15 +195,4 @@ class Solver:
             time.sleep(2e-3)
             print(i)
             i+=1
-        #self.plot_taskspace_trajectory(eetraj.translation, "eetraj", color=0xff0000)
-        # for q_step in qtraj:
-        #     self.viz.display(q_step)
-        #     #self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
-        #     #self.viz.viewer["point"].set_transform(tf.translation_matrix(desired_pos))
-        #     #self.viz.viewer["targetPose"].set_object(g.triad(scale=0.2))
-        #     #self.viz.viewer["targetPose"].set_transform(eetraj[j].homogeneous)
-
-            
-        #     time.sleep(1e-3)
-        #     print(j)
-        #     j+=1
+  
