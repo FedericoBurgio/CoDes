@@ -1,3 +1,4 @@
 consim/
 src/visualizer.py
 src/__pycache__/
+experiments/

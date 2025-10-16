@@ -1,0 +1,38 @@
+{
+  "simulation": {
+    "dt": 5e-5,
+    "T": 10
+  },
+  "pd": {
+    "type": "pd",        
+    "kp": 1000,
+    "q_des": []
+  },
+  "robot": {
+    "q_init": [0, 0, 0, 0, 0, 0],
+    "q_des": [0, 1.57, -1.57, 0, 0, 0],
+    "q_target_is_q_init": true,
+    "random_init": false
+  },
+  "forces": {
+    "EE_force": [0, 0, 0],
+    "EE_torque": [0, 0, 0],
+    "EE_apply_after": 20000,
+    "grinder_force": [100, 0, 0],
+    "grinder_torque": [0, 0, 0],
+    "grinder_apply_after": 20000,
+    "grinder_force_release_after": 60000
+  },
+  "grinder": {
+    "grinder_in_use": true,
+    "mass": 1,
+    "interia_npy": "configs/interia.npy",
+    "offset": [0, 0, 0],
+    "k_lin": 1e2,
+    "k_rot": 1e1
+  },
+  "experiment": {
+    "name": "conf1_with_force",
+    "output_dir": "experiments/set1"
+  }
+}

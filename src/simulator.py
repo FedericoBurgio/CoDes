@@ -1,156 +1,173 @@
-import pinocchio as pin
-from pinocchio.visualize import MeshcatVisualizer
+import os
 import numpy as np
 import time
-import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pinocchio as pin
 
-import meshcat.geometry as g
-import meshcat.transformations as tf
-
-import os
-    
 from grinder import GrinderAndInterface
-
+from controllers import PDJointController, OSCController
+from kinematics import damped_ls_ik
+from visualization import maybe_create_viz
 
 class Solver:
-    def __init__(self, urdf_path: str, EE_name: str, rnd = False):
-  
+    def __init__(self, urdf_path: str, EE_name: str, conf):
+        """Same public API; internal structure refactored."""
         self.rmodel, self.collision_model, self.visual_model = pin.buildModelsFromUrdf(urdf_path)
         self.data = self.rmodel.createData()
         self.end_effector = EE_name
         self.ee_id = self.rmodel.getFrameId(EE_name)
-        self.maxExtension = -1
+        self.dt = conf["simulation"]["dt"]
+        self.T = conf["simulation"]["T"]
 
-        #robot init
-        self.robot_init(rnd)
+        self.q_ik_seed = 0
+        self.conf = conf    
+
+        # robot + viz initialization
+        self.robot_init()
         self.visual_init()
+        self.grinder = None
+        if self.conf["grinder"]["grinder_in_use"]:
+            m = self.conf["grinder"]["mass"]
+            I_local = np.eye(3)
+            offset = np.array(self.conf["grinder"]["offset"])
+            k_lin = self.conf["grinder"]["k_lin"]
+            k_rot = self.conf["grinder"]["k_rot"]
+            print("Grinder in use")
+            self.grinder = GrinderAndInterface(m, I_local, offset, k_lin, k_rot, self.data.oMf[self.ee_id], self.dt)
+        else:
+            print("Grinder not in use")
 
-        #grinder - externally initialized
-        self.grinder = GrinderAndInterface(5, np.eye(3), [0, 0, 0.05], self.data.oMf[self.ee_id])
-
-    def robot_init(self, rnd):
-        self.q = np.zeros(self.rmodel.nq)
-        #self.q[1]=np.pi # the base ahs an height, which is limiting (below 0?)
-
-        self.dq = np.zeros(self.rmodel.nq)
-        pin.forwardKinematics(self.rmodel, self.data, self.q, self.dq)
-        pin.updateFramePlacements(self.rmodel, self.data)
-        self.maxExtension = np.linalg.norm(self.data.oMf[self.ee_id].translation)
-        
-        if rnd:
+    def robot_init(self):
+        if self.conf["robot"]["random_init"]:
             self.q = np.random.uniform(-np.pi, np.pi, self.rmodel.nq)
             self.dq = np.random.uniform(-np.pi, np.pi, self.rmodel.nq)
             pin.forwardKinematics(self.rmodel, self.data, self.q, self.dq)
             pin.updateFramePlacements(self.rmodel, self.data)
- 
+        else:
+            self.q = np.array(self.conf["robot"]["q_init"])
+            self.dq = np.zeros(self.rmodel.nq)
+            pin.forwardKinematics(self.rmodel, self.data, self.q, self.dq)
+            pin.updateFramePlacements(self.rmodel, self.data)
+
     def visual_init(self):
-        # Avvia MeshCat-server in un terminale a parte:
-        # python -m meshcat.serving.server
-        # Apri nel browser l'URL mostrato in console (es. http://127.0.0.1:7000/static/)
-        self.viz = MeshcatVisualizer(self.rmodel, self.collision_model, self.visual_model)
-        self.viz.initViewer(loadModel=True, open=True)
-        self.viz.loadViewerModel()
-        self.viz.display(self.q)
-        time.sleep(2)
-  
-    def track_trajectory(self, pos_traj, rot_traj, dt, total_time,
-                    kp_lin=1e3, kp_rot=1e2,
-                    kd_lin=None, kd_rot=None):
-        steps = pos_traj.shape[0]
-
-        if kd_lin == None: kd_lin=np.sqrt(2*kp_lin)
-        if kd_rot == None: kd_rot=np.sqrt(2*kp_rot)
-
-        Kp = np.diag([kp_lin]*3 + [kp_rot]*3)
-        Kd = np.diag([kd_lin]*3 + [kd_rot]*3)
-
-        force_period = 0.2 #every .2 sec
-        force_steps = int(force_period / dt) # dt = 1e-3 => every 200 steps 
+        self.viz = maybe_create_viz(self.rmodel, self.collision_model, self.visual_model)
+        if self.viz is not None:
+            self.viz.display(self.q)
     
-        #preall or optimiz
-        q_traj = np.empty((steps,self.rmodel.nq))
-        dq_traj = np.empty((steps,self.rmodel.nq))
-        ddq_traj = np.empty((steps,self.rmodel.nq))
-        oMf_traj = [None] * steps #cartesian xyz, wrld frame
+    def grinder_init(self, m, I_local, offset, k_lin, k_rot):
+        self.grinder = GrinderAndInterface(m, I_local, offset, k_lin, k_rot, self.data.oMf[self.ee_id], self.dt)
 
-        grinder_traj = np.empty((steps,3)) #grinder position in world frame
-        dqmax = np.array([3, 3, 3, 3, 3, 3]) #max joint velocity
-        dqqmax = np.array([30, 30, 30, 30, 30, 30]) #max joint acceleration
-        for i in range(steps):
-            desired_pos = pos_traj[i]
-            desired_rot = rot_traj[i]
+    def solve_ik(self, oMd, q_init=None, max_iters=50, tol=1e-4, damp=1e-3, step_size=1.0):
+        """Method name/signature preserved; delegates to helper."""
+        if q_init is None:
+            q_init = self.q.copy()
+        return damped_ls_ik(self.rmodel, self.data, self.ee_id, oMd, q_init,
+                            max_iters=max_iters, tol=tol, damp=damp, step_size=step_size)
 
-            oMf = self.data.oMf[self.ee_id].copy()  # get current end-effector pose
-            oRf = oMf.rotation  # Rotation of the end-effector in world frame
-            oMfdesired = pin.SE3(desired_rot, desired_pos)
-            fMfdesired = oMf.inverse() * oMfdesired
-            err_local = pin.log(fMfdesired).vector
-            
-            E = np.block([[oRf, np.zeros((3,3))],
-              [np.zeros((3,3)), oRf]])
-            err = E @ err_local
-            #err = np.zeros(6) # Dummy: EE stays in place (debugging)
+    def follow_fixed_qdes(self):
+        """Toggle with env vars for fast tests."""
+        self.q_ik_seed = self.q.copy()
+        steps = int(self.T/self.dt)
+        pdj = PDJointController(self.rmodel, self.conf["pd"]["kp"])
 
-            self.viz.viewer["Setpoint"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x0000ff))
-            self.viz.viewer["Setpoint"].set_transform(tf.translation_matrix(pos_traj[i]))
 
-            self.viz.viewer["SetPose"].set_object(g.triad(scale=0.2))
-            self.viz.viewer["SetPose"].set_transform(pin.SE3(rot_traj[i], pos_traj[i]).homogeneous)
+        # prealloc
+        q_traj = np.empty((steps, self.rmodel.nq))
+        dq_traj = np.empty((steps, self.rmodel.nq))
+        ddq_traj = np.empty((steps, self.rmodel.nq))
+        wrench_traj = np.empty((steps, 6))
+        deltax_traj = np.empty((steps, 3))
+        tau_traj = np.empty((steps, 6))
+        oMf_traj = [None] * steps
+       
+        grinder_traj = np.empty((steps, 3))
+        grinder_relative_traj = np.empty((steps, 3))
 
-            self.viz.viewer["point"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
-            self.viz.viewer["point"].set_transform(tf.translation_matrix(oMf.translation))
+        # limits 
+        dqmax = np.array([3, 3, 3, 3, 3, 3])
+        dqqmax = np.array([30, 30, 30, 30, 30, 30])
 
-            self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
-            self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(self.grinder.x[:3]))
-           
-            vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-           
-            #if i % force_steps == 0: f+=self.random_force(25)
-            fext = self.random_force(50000)  if i % force_steps == 0 else np.zeros(6) #random force every force_period seconds
-            #fext = np.array([1e4]*6) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
-            #fext = np.array([0]*3+[1e5]+[0]*2) if i % force_steps == 0 else np.zeros(6)  # constant force for debugging
-            wrench = self.grinder.dyn(oMf, vEE, fext) #get the wrench in the world frame
-
-            #wrench = np.zeros(6) 
-
+        rng = tqdm(range(0, steps))
+        for i in rng:
             pin.forwardKinematics(self.rmodel, self.data, self.q, self.dq)
             pin.updateFramePlacements(self.rmodel, self.data)
             pin.computeAllTerms(self.rmodel, self.data, self.q, self.dq)
 
+            oMf = self.data.oMf[self.ee_id].copy()
+            vEE = pin.getFrameVelocity(self.rmodel, self.data, self.ee_id,
+                                       pin.ReferenceFrame.WORLD)
 
-            J = pin.computeFrameJacobian(self.rmodel, self.data, self.q,
-                                        self.ee_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-            err_dx = - J @ self.dq
+            # external force 
+            if i > self.conf["forces"]["EE_apply_after"]:
+                f_world = np.array(self.conf["forces"]["EE_force"])
+                m_world = np.array(self.conf["forces"]["EE_torque"])
+            else:
+                f_world = np.zeros(3)
+                m_world = np.zeros(3)
 
-            ddx_des = Kp @ err + Kd @ err_dx
+            # grinder dynamics to wrench in world
+            if self.grinder != None:
+                if i > self.conf["forces"]["grinder_apply_after"] and i < self.conf["forces"]["grinder_force_release_after"]:
+                    fextw = np.array(self.conf["forces"]["grinder_force"])
+                    mextw = np.array(self.conf["forces"]["grinder_torque"])
+                else:
+                    fextw = np.zeros(3)
+                    mextw = np.zeros(3)
 
-            # OSC (with regularization)
-            M = self.data.M.copy()
-            b = self.data.nle.copy()
-            reg_eps = 1e-4
-            Lambda = np.linalg.inv(J @ np.linalg.inv(M) @ J.T + reg_eps * np.eye(6))
-            mu = Lambda @ (J @ np.linalg.inv(M) @ b)
-            f = Lambda @ ddx_des + mu - wrench
-
-            #if i % force_steps == 0: f+=self.random_force(25) # apply f firectly to the ee
-
-            tau = J.T @ f  # No +b here, since mu already used
-
-            # Integrate
-            ddq = np.clip(pin.aba(self.rmodel, self.data, self.q, self.dq, tau), -dqqmax, dqqmax)
-            self.dq = np.clip(self.dq + ddq * dt, -dqmax, dqmax)
-            self.q = pin.integrate(self.rmodel, self.q, dt * self.dq)
+                f_wrench, m_wrench, deltax = self.grinder.dyn(oMf, vEE, fextw, mextw)
+                self.grinder.step()
+            else:
+                f_wrench = np.zeros(3)
+                m_wrench = np.zeros(3)
+                deltax = np.zeros(3)
+  
+            if self.conf["robot"]["q_target_is_q_init"]:
+                q_des = self.conf["robot"]["q_init"]
+            else:
+                q_des = self.conf["robot"]["q_des"]
             
-            self.grinder.step()
-            
-            q_traj[i]=self.q.copy()
-            dq_traj[i]=self.dq.copy()
-            ddq_traj[i]=ddq.copy()
-            oMf_traj[i]=oMf.copy()
+            dq_des = np.zeros_like(self.dq)
+            tau_ctrl = pdj.tau(self.q, self.dq, q_des, dq_des)
 
-            grinder_traj[i] = self.grinder.x[:3].copy()
+            J = pin.computeFrameJacobian(self.rmodel, self.data, self.q, self.ee_id,
+                                         pin.ReferenceFrame.WORLD)
             
-        return q_traj, dq_traj, ddq_traj, oMf_traj, grinder_traj, dt, total_time
+
+            Jlin = J[:3, :]   # linear rows (vx, vy, vz)
+            Jang = J[3:, :]   # angular rows (wx, wy, wz)
+
+            tau_ext    = Jlin.T @ f_world   + Jang.T @ m_world
+            tau_wrench = Jlin.T @ f_wrench  + Jang.T @ m_wrench
+            tau_cmd    = tau_ctrl - tau_ext + tau_wrench
+            
+        
+            ddq = pin.aba(self.rmodel, self.data, self.q, self.dq, tau_cmd)
+            self.q = pin.integrate(self.rmodel, self.q, self.dt * self.dq)
+            self.dq = self.dq + ddq * self.dt
+
+            if self.grinder is not None:
+                self.grinder.step()
+
+            q_traj[i] = self.q.copy()
+            dq_traj[i] = self.dq.copy()
+            ddq_traj[i] = ddq.copy()
+            oMf_traj[i] = oMf.copy()
+            oRf = oMf.rotation
+            if self.grinder is not None:
+                grinder_traj[i] = self.grinder.x[:3].copy()
+                grinder_relative_traj[i] = oRf.T @ (self.grinder.x[:3] - oMf.translation)
+                wrench_traj[i] = np.hstack([f_wrench, m_wrench])
+            deltax_traj[i] = deltax.copy()
+            tau_traj[i] = tau_cmd.copy()
+
+            rng.set_description(f"Sim: {i+1}/{steps})")
+
+
+        return (
+            q_traj, dq_traj, ddq_traj, tau_traj, oMf_traj,
+            grinder_traj, grinder_relative_traj, wrench_traj, deltax_traj
+        )
+
 
     def random_force(self, force_std, torque_std=None):
         if torque_std is None:
@@ -160,39 +177,36 @@ class Solver:
         return np.concatenate([f, tau])
 
     def plot_taskspace_trajectory(self, pos_traj, name="desired_traj", color=0x00ff00):
-        """
-        Plot a trajectory in task space in Meshcat as a line.
-
-        Args:
-            pos_traj: np.ndarray of shape (N, 3), the positions (x, y, z)
-            name: str, Meshcat object name
-            color: int, RGB hex
-        """
-        from meshcat.geometry import Line, PointsGeometry, PointsMaterial
-        # Meshcat expects shape (3, N)
-        pts = pos_traj.T  # shape (3, N)
+        from meshcat.geometry import Line, PointsGeometry
+        import meshcat.geometry as g
+        if self.viz is None:
+            return
+        pts = pos_traj.T
         self.viz.viewer[name].set_object(
-            Line(
-                PointsGeometry(pts),
-                material=g.MeshLambertMaterial(color=color, linewidth=16)
-            )
+            Line(PointsGeometry(pts), material=g.MeshLambertMaterial(color=color, linewidth=16))
         )
 
-    def replay_traj(self, qtraj, eetraj, grinder_traj):
-        i=0
+    def replay_traj(self, qtraj, eetraj, grinder_traj, slowmo=60):
+        # Method name preserved; behavior tightened for 60Hz-ish playback
+        if self.viz is None:
+            return
         import meshcat.geometry as g
-        #breakpoint()
+        import meshcat.transformations as tf
+        i = 0
+        inc = max(1, int((1 / self.dt) / 60))
+        inc = int(inc/slowmo)
+        #sleep_time = 1 / fps
+        bar = tqdm(total=qtraj.shape[0])
         while i < qtraj.shape[0]:
             self.viz.display(qtraj[i])
-            desired_pos = eetraj[i].translation
             self.viz.viewer["targetPose"].set_object(g.triad(scale=0.2))
             self.viz.viewer["targetPose"].set_transform(eetraj[i].homogeneous)
-
-            # Display grinder position
-            self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
-            self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(grinder_traj[i]))
-
-            time.sleep(2e-3)
-            print(i)
-            i+=1
-  
+            if self.grinder is not None:
+                self.viz.viewer["pointGrinder"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x00ff00))
+                self.viz.viewer["pointGrinder"].set_transform(tf.translation_matrix(grinder_traj[i]))
+            self.viz.viewer["EEpoint"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0xff0000))
+            self.viz.viewer["EEpoint"].set_transform(tf.translation_matrix(eetraj[i].translation))
+            i += inc
+            bar.update(inc)
+            time.sleep(.01666)
+        bar.close()
